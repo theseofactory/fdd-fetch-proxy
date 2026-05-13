@@ -122,10 +122,10 @@ jobs:
                   })
               time.sleep(0.6)  # politeness
 
-          out_path = f'out/{batch_id}.json'
+          out_path = 'out/results.json'
           with open(out_path, 'w') as f:
               json.dump({'batch_id': batch_id, 'results': results}, f)
-          print(f'wrote {len(results)} results to {out_path}')
+          print(f'wrote {len(results)} results to results.json')
           PY
       - name: Upload artifact
         uses: actions/upload-artifact@v4
