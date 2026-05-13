@@ -1,0 +1,135 @@
+name: FDD Fetch Batch (Extended)
+run-name: 'fdd-fetch-ext-${{ inputs.batch_id }}'
+# Extended workflow: handles both GET (URL strings) AND POST (dict entries
+# with {url, method, form_data, headers}). Used by the WI DFI search flow
+# which needs to POST __VIEWSTATE + form data through a US-egress runner.
+
+on:
+  workflow_dispatch:
+    inputs:
+      urls_json:
+        description: 'JSON array of URL strings (GET) OR entry dicts (POST). Entry dict shape: {url, method, form_data, headers}'
+        required: true
+      batch_id:
+        required: true
+      user_agent:
+        required: false
+        default: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36'
+
+permissions:
+  contents: read
+
+jobs:
+  fetch:
+    name: Fetch ${{ inputs.batch_id }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Fetch URLs
+        env:
+          URLS_JSON: ${{ inputs.urls_json }}
+          BATCH_ID: ${{ inputs.batch_id }}
+          USER_AGENT: ${{ inputs.user_agent }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          python3 <<'PY'
+          import base64, hashlib, json, os, ssl, time
+          import urllib.error, urllib.parse, urllib.request
+
+          entries = json.loads(os.environ['URLS_JSON'])
+          batch_id = os.environ['BATCH_ID']
+          ua = os.environ['USER_AGENT']
+
+          base_headers = {
+              'User-Agent': ua,
+              'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,application/pdf,*/*;q=0.8',
+              'Accept-Language': 'en-US,en;q=0.9',
+          }
+
+          ctx = ssl.create_default_context()
+          MAX_BYTES = 25 * 1024 * 1024  # 25 MB cap per response
+
+          # Cookie jar that PERSISTS across entries — WI DFI needs the
+          # session cookie from the GET to be sent on the POST.
+          import http.cookiejar
+          jar = http.cookiejar.CookieJar()
+          opener = urllib.request.build_opener(
+              urllib.request.HTTPCookieProcessor(jar)
+          )
+
+          def to_record(entry):
+              if isinstance(entry, str):
+                  return {'url': entry, 'method': 'GET', 'form_data': {}, 'headers': {}}
+              return {
+                  'url': entry['url'],
+                  'method': (entry.get('method') or 'GET').upper(),
+                  'form_data': entry.get('form_data') or {},
+                  'headers': entry.get('headers') or {},
+              }
+
+          results = []
+          for entry in entries:
+              rec = to_record(entry)
+              url = rec['url']
+              t0 = time.monotonic()
+              headers = {**base_headers,
+                         'Referer': '/'.join(url.split('/')[:3]) + '/',
+                         **rec['headers']}
+              data = None
+              if rec['method'] == 'POST':
+                  data = urllib.parse.urlencode(rec['form_data']).encode()
+                  headers.setdefault('Content-Type', 'application/x-www-form-urlencoded')
+              try:
+                  req = urllib.request.Request(url, data=data, headers=headers,
+                                                method=rec['method'])
+                  with opener.open(req, timeout=45) as resp:
+                      body = resp.read(MAX_BYTES + 1)
+                      truncated = len(body) > MAX_BYTES
+                      if truncated:
+                          body = body[:MAX_BYTES]
+                      results.append({
+                          # Echo the original entry back so the caller's
+                          # results dict key matches whatever they sent.
+                          'url': entry,
+                          'status': resp.status,
+                          'content_type': resp.headers.get('Content-Type', ''),
+                          'final_url': resp.url,
+                          'body_b64': base64.b64encode(body).decode(),
+                          'body_size': len(body),
+                          'sha256': hashlib.sha256(body).hexdigest(),
+                          'truncated': truncated,
+                          'elapsed_ms': int((time.monotonic() - t0) * 1000),
+                      })
+              except urllib.error.HTTPError as e:
+                  body = b''
+                  try: body = e.read() or b''
+                  except: pass
+                  results.append({
+                      'url': entry, 'status': e.code,
+                      'content_type': (e.headers.get('Content-Type','') if e.headers else ''),
+                      'final_url': url,
+                      'body_b64': base64.b64encode(body[:MAX_BYTES]).decode(),
+                      'body_size': len(body),
+                      'error': f'HTTPError {e.code}',
+                      'elapsed_ms': int((time.monotonic() - t0) * 1000),
+                  })
+              except Exception as e:
+                  results.append({
+                      'url': entry, 'status': 0,
+                      'error': f'{type(e).__name__}: {e}',
+                      'elapsed_ms': int((time.monotonic() - t0) * 1000),
+                  })
+              time.sleep(0.6)  # politeness
+
+          out_path = f'out/{batch_id}.json'
+          with open(out_path, 'w') as f:
+              json.dump({'batch_id': batch_id, 'results': results}, f)
+          print(f'wrote {len(results)} results to {out_path}')
+          PY
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fdd-batch-${{ inputs.batch_id }}
+          path: out/
+          retention-days: 1
